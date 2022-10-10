@@ -22,8 +22,35 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type TaskKind int
 
+const (
+	Map_Task 	TaskKind = 1
+	Reduce_Task	TaskKind = 2
+	Idle_Task	TaskKind = 3	//let worker sleep
+)
+
+// Add your RPC definitions here.
+type RequestTaskArgs struct {
+
+}
+
+type RequestTaskReply struct {
+	Task_kind 		TaskKind			
+	Map_file_name	string		//filename need in map func
+	Reducer_num		int			//reducer number
+	Map_num			int
+	Task_idx		int			//idx for task
+}
+
+type DoneTaskArgs struct {
+	Task_kind 		TaskKind
+	Task_idx		int
+}
+
+type DoneTaskReply struct{
+	
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

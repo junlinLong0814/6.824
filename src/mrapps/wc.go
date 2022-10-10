@@ -20,6 +20,7 @@ import "strconv"
 //
 func Map(filename string, contents string) []mr.KeyValue {
 	// function to detect word separators.
+	// IsLetter : report r is a letter or not(eg:'a' is a letter and '7' isn't)
 	ff := func(r rune) bool { return !unicode.IsLetter(r) }
 
 	// split contents into an array of words.
