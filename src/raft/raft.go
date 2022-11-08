@@ -21,35 +21,18 @@ import "sync"
 import "sync/atomic"
 import "../labrpc"
 import "time"
+//import "fmt"
 
 
 // import "bytes"
 // import "../labgob"
 
-
-
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-}
-
 type RaftState int
 
 type LogEntry struct{
-	Term  int
-	Index int
+	Term  		int
+	Index 		int
+	Command		interface{}
 }
 
 const (
@@ -68,6 +51,7 @@ const (
 //
 type Raft struct {
 	mu        sync.Mutex          		// Lock to protect shared access to this peer's state
+	cv 		  *sync.Cond 				// the cv for sync producer and consumer
 	peers     []*labrpc.ClientEnd 		// RPC end points of all peers
 	persister *Persister          		// Object to hold this peer's persisted state
 	me        int                 		// this peer's index into peers[]
@@ -86,8 +70,6 @@ type Raft struct {
 	poll			int					//received vote count
 
 	commitIndex		int					//index of highest log entry known to be commited
-	lastApplied 	int					//index of highest log entry applied to state machine
-
 	/*only for leader*/
 	nextIndex		[]int				//for each server,index of the next log entry to send to that sever
 										//initialized to leader last log index + 1		
@@ -97,9 +79,8 @@ type Raft struct {
 	expiredAppendTimes	[]time.Time		//After appended the log entry to all server,
 										//When a server does not reply within the expiredAppendTimes[i] time
 										//and that server time out
-	
-	peerSuccess		int					//received success count,if more than half of len(peer),return client success
-										//and update commitidx
+
+	commitQueue		[]ApplyMsg			//consumer-procuder model,buff for applyMsg
 }
 
 // return currentTerm and whether this server
@@ -173,14 +154,32 @@ func (rf *Raft) readPersist(data []byte) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.killed(){
+		return -1,-1,false
+	}
 
-	return index, term, isLeader
+	if rf.myState != Leader{
+		return -1,-1,false
+	}else{
+		prevLogIdx,curTerm := rf.logs[len(rf.logs)-1].Index, rf.currentTerm
+		rf.logs = append(rf.logs,LogEntry{
+			Term:		curTerm,
+			Index:		prevLogIdx + 1,
+			Command:	command,
+		})
+		
+		for i := 0; i < len(rf.peers); i++{
+			if i != rf.me{
+				rf.resetAppendTimer(i,true)
+			}
+		}
+
+		return prevLogIdx+1, curTerm, true
+	}
 }
 
 //
@@ -274,11 +273,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		myState:				Follower,
 		nextIndex:				make([]int,serversCount),
 		expiredAppendTimes:		make([]time.Time,serversCount),
-//		peerSuccess:			1,
+		matchIndex:				make([]int,serversCount),
+		commitQueue:			make([]ApplyMsg,0),
+		
 	}
+	rf.cv = sync.NewCond(&rf.mu)
 	rf.logs = append(rf.logs,LogEntry{
-		Index:	0,
-		Term:	0,
+		Index:		0,
+		Term:		0,
+		Command: 	nil,
 	})
 
 	rf.resetElectionTimer()
@@ -294,6 +297,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go rf.leaderElectionTicker()
 	go rf.appendEntriesTricker()
+	
+	go rf.applyTicker(applyCh)
 
 	return rf
 }

@@ -101,6 +101,13 @@ func (rf *Raft) callForVote(other,currentTerm,me,index,term int){
 			if rf.poll > len(rf.peers)/2{
 				VoteInfo("[%s] %d got %d vote!\n",TimeInfo(),rf.me, rf.poll)
 				rf.changeState(Leader,-1,-1)
+
+				//when win the election, send entry immediately
+				for i:= 0; i < len(rf.peers); i++{
+					if i != rf.me{
+						rf.resetAppendTimer(i,true)
+					}
+				}
 			}
 		}
 	}

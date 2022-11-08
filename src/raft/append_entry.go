@@ -23,6 +23,13 @@ func min(a,b int) int{
 	return b
 }
 
+func max(a,b int) int{
+	if a > b{
+		return a
+	}
+	return b
+}
+
 func (rf *Raft) sendAppendEntries(server int, args *appendArgs, reply *appendReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
@@ -52,7 +59,7 @@ func (rf *Raft) appendEntriesTricker(){
 			tmpLog := make([]LogEntry,rf.logs[len(rf.logs)-1].Index - rf.nextIndex[i]+1)
 			copy(tmpLog,rf.logs[rf.getIndexByAbsoluteIndex(rf.nextIndex[i]) : ])
 
-			go rf.callForAppend(i,rf.currentTerm,rf.me,rf.nextIndex[i]-1,rf.logs[rf.getTermByAbsoluteIndex(rf.nextIndex[i]-1)].Term,rf.commitIndex,tmpLog)
+			go rf.callForAppend(i,rf.currentTerm,rf.me,rf.nextIndex[i]-1,rf.getTermByAbsoluteIndex(rf.nextIndex[i]-1),rf.commitIndex,tmpLog)
 			rf.resetAppendTimer(i,false)
 		}
 		rf.mu.Unlock()
@@ -108,14 +115,35 @@ func (rf *Raft) callForAppend(peer,currentTerm,me,PrevLogIndex,PrevLogTerm,Leade
 			}
 			rf.resetAppendTimer(peer,true)
 		}else{
-			//peer reply success means peer's logs are same as mine
-			//update peer's nextIndex
-			//and add peerSuccess
-			//when peerSuccess > half of (len(peers)), update and send commit idx
 			rf.nextIndex[peer] = rf.nextIndex[peer] + len(logs)
+			rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+			//count all the peer's mathcIndex
+			//check if there are more than half of the matchIndex,
+			//if exist, update the commitIndex
+			
+			newCommitindex := 0
+			count := make(map[int]int)
+			for i:=0 ; i < len(rf.peers); i++{
+				if i != rf.me{
+					count[rf.matchIndex[i]]++
+					if count[rf.matchIndex[i]] + 1 > len(rf.peers)/2{
+						newCommitindex = max(newCommitindex,rf.matchIndex[i])
+					} 
+				}
+			}
+			if newCommitindex > rf.commitIndex && newCommitindex <= rf.logs[len(rf.logs)-1].Index && rf.getTermByAbsoluteIndex(newCommitindex) == rf.currentTerm{
+				for i := rf.commitIndex+1; i <= newCommitindex; i++{
+					rf.commitQueue = append(rf.commitQueue,ApplyMsg{
+						CommandValid:	true,
+						Command:		rf.logs[rf.getIndexByAbsoluteIndex(i)].Command,
+						CommandIndex:	i,
+					})
+				}  
+				rf.commitIndex = newCommitindex
+				rf.cv.Broadcast()
+			}
 
-
-			rf.peerSuccess += 1
+			rf.resetAppendTimer(peer,false)
 		}
 
 		
@@ -136,20 +164,22 @@ func (rf *Raft) AppendEntries(args *appendArgs, reply *appendReply){
 
 	//check the log version
 	curLastLogIndex := rf.logs[len(rf.logs)-1].Index
-	DeBugPrintf("%d receive{Idx:%d Term:%d}entry, myLastIdx:%d\n",rf.me,args.PrevLogIndex, args.PrevLogTerm, curLastLogIndex)
-	if curLastLogIndex < args.PrevLogIndex || rf.getTermByAbsoluteIndex(args.PrevLogIndex) != args.PrevLogTerm{
+	if curLastLogIndex < args.PrevLogIndex  {
 		//my logs doesn't contain an entry at prevlogindex
 		reply.Success = false
 		reply.Term = args.Term
-		DeBugPrintf("%d's %d log's term is %d\n",rf.me,args.PrevLogIndex,rf.getTermByAbsoluteIndex(args.PrevLogIndex))
+		//DeBugPrintf("%d's %d log's term is %d\n",rf.me,args.PrevLogIndex,rf.getTermByAbsoluteIndex(args.PrevLogIndex))
+	}else if rf.getTermByAbsoluteIndex(args.PrevLogIndex) != args.PrevLogTerm{
+		reply.Success = false
+		reply.Term = args.Term
 	}else{
 		reply.Success = true
 		reply.Term = args.Term
 		//match prev index 
 		//check if exist confict log
 		confictIdx := -1
-		for i := 1; i < len(args.Entries); i++{
-			curIdx := args.PrevLogIndex + i
+		for i := 0; i < len(args.Entries); i++{
+			curIdx := args.PrevLogIndex + i + 1
 			if curIdx > curLastLogIndex{
 				confictIdx = curIdx
 				break
@@ -166,8 +196,21 @@ func (rf *Raft) AppendEntries(args *appendArgs, reply *appendReply){
 			//[args.PrevLogIndex,confictIdx) match
 			//[confictIdx,len(args.Entries)) not match
 			rf.logs = rf.logs[0 : confictAbsIdx]
-			rf.logs = append(rf.logs, args.Entries[confictIdx - args.PrevLogIndex:]...)
+			rf.logs = append(rf.logs, args.Entries[confictIdx - args.PrevLogIndex - 1:]...)
 		}
+
+
+		LogInfo("leader's curLog:\n")
+		for i:=0; i<len(args.Entries);i++{
+			NoTimeLogInfo("{idx: %d,term: %d},",args.Entries[i].Index,args.Entries[i].Term)
+		}
+		NoTimeLogInfo("\nconfict idx: %d, abs: %d\n",confictIdx,rf.getIndexByAbsoluteIndex(confictIdx))
+
+		LogInfo("%d 's curLog:\n",rf.me)
+		for i:=0; i<len(rf.logs);i++{
+			NoTimeLogInfo("{idx: %d,term: %d},",rf.logs[i].Index,rf.logs[i].Term)
+		}
+		NoTimeLogInfo("\n")
 
 		//check leader's commit idx and update mine
 		commitIdxBak := rf.commitIndex
@@ -177,13 +220,18 @@ func (rf *Raft) AppendEntries(args *appendArgs, reply *appendReply){
 			rf.commitIndex = min(args.LeaderCommit,rf.logs[len(rf.logs)-1].Index)
 		}
 		
-
-		//TODO:
-		//apply logs in (commitIdxBak,rf.commitIndex] to state machine
-		for i := commitIdxBak + 1; i <= rf.commitIndex; i++{
-			//apply logs[i] to state machine
+		if rf.commitIndex > commitIdxBak{
+			//apply logs in (commitIdxBak,rf.commitIndex] to state machine
+			for i := commitIdxBak + 1; i <= rf.commitIndex; i++{
+				//apply logs[i] to state machine
+				rf.commitQueue = append(rf.commitQueue,ApplyMsg{
+					CommandValid:	true,
+					Command:		rf.logs[rf.getIndexByAbsoluteIndex(i)].Command,
+					CommandIndex:	i,
+				})
+			}
+			rf.cv.Broadcast()
 		}
-
 	}
 
 	//if leader's term > mine , should change to be a follower
