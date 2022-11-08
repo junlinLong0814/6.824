@@ -24,8 +24,8 @@ import "time"
 //import "fmt"
 
 
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 type RaftState int
 
@@ -62,9 +62,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	myState   		RaftState			//Server state
-	currentTerm		int					//my term
-	voteFor	 		int					//vote for x
-	logs	  		[]LogEntry			//log entries
+	currentTerm		int					//my term (be persistent)
+	voteFor	 		int					//vote for x (be persistent)
+	logs	  		[]LogEntry			//log entries (be persistent)
 	expiredElectionTime		time.Time	//if now() > expiredElectionTime,it should start a election
 
 	poll			int					//received vote count
@@ -106,13 +106,14 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	LogInfo("[%d] persist, len(logs):[%d], currentTerm:[%d], voteFor:[%d]\n",rf.me,len(rf.logs),rf.currentTerm,rf.voteFor)
 }
 
 
@@ -124,18 +125,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term	int
+	var voteFor int
+	var logs	[]LogEntry
+	if d.Decode(&term) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&logs) != nil{
+		DeBugPrintf("%d readPersist Decode error!\n",rf.me)	
+	} else {
+	  rf.currentTerm = term
+	  rf.logs = logs
+	  rf.voteFor = voteFor
+	  LogInfo("[%d] readPersist, len(logs):[%d], currentTerm:[%d], voteFor:[%d]\n",rf.me,len(rf.logs),rf.currentTerm,rf.voteFor)
+	}
 }
 
 
@@ -171,7 +175,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Index:		prevLogIdx + 1,
 			Command:	command,
 		})
-		
+		rf.persist()
+
 		for i := 0; i < len(rf.peers); i++{
 			if i != rf.me{
 				rf.resetAppendTimer(i,true)
@@ -209,7 +214,8 @@ func (rf *Raft) changeState(ideal_state RaftState,newTerm int, voteFor int){
 		rf.voteFor = rf.me
 		rf.myState = Candicate
 		rf.poll = 1
-		VoteInfo("[%s] %d -> Candicate Term:%d\n",TimeInfo(),rf.me,rf.currentTerm)
+		rf.persist()
+		LogInfo("[%s] %d -> Candicate Term:%d\n",TimeInfo(),rf.me,rf.currentTerm)
 	}else if ideal_state == Leader{
 		rf.myState = Leader
 		for i := 0; i < len(rf.peers) ;i++{
@@ -218,14 +224,16 @@ func (rf *Raft) changeState(ideal_state RaftState,newTerm int, voteFor int){
 			}
 		}
 		rf.poll = 0
-		VoteInfo("[%s] %d -> Leader Term:%d \n",TimeInfo(),rf.me,rf.currentTerm)
+		LogInfo("[%s] %d -> Leader Term:%d \n",TimeInfo(),rf.me,rf.currentTerm)
 	}else if ideal_state == Follower{
 		rf.myState = Follower
 		rf.currentTerm = newTerm
 		rf.voteFor = voteFor
 		rf.poll = 0
-		VoteInfo("[%s] %d -> Follower Term:%d\n",TimeInfo(),rf.me,rf.currentTerm)
+		rf.persist()
+		LogInfo("[%s] %d -> Follower Term:%d\n",TimeInfo(),rf.me,rf.currentTerm)
 	}
+	
 }
 
 func (rf *Raft) getTermByAbsoluteIndex(index int) int{
@@ -254,11 +262,6 @@ func (rf *Raft) getIndexByAbsoluteIndex(index int) int{
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	
-	// rf := &Raft{}
-	// rf.peers = peers
-	// rf.persister = persister
-	// rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
 	serversCount := len(peers)

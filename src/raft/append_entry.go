@@ -14,20 +14,15 @@ type appendArgs struct {
 type appendReply struct {
 	Term			int				//currentTerm, for leader to update itself
 	Success			bool 			//true if follower contained entry mathcing preLogIndex and prevLogTerm
-}
 
-func min(a,b int) int{
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a,b int) int{
-	if a > b{
-		return a
-	}
-	return b
+	//for Figure 8 (unreliable)
+	//in a chaotic network state, this test requires that the log
+	//be submitted successfully within 10s, and each attempt must
+	//be submitted successfully within 2s.However, it takes a lot 
+	//of time to sync preimary and secondary logs in a basic way,
+	//so we need to speed up log synchronization
+	ConflictTerm  	int
+	ConflictIndex 	int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *appendArgs, reply *appendReply) bool {
@@ -56,7 +51,8 @@ func (rf *Raft) appendEntriesTricker(){
 				//still in time
 				continue
 			}
-			tmpLog := make([]LogEntry,rf.logs[len(rf.logs)-1].Index - rf.nextIndex[i]+1)
+			LogInfo("[%d]'s log'slen:[%d]; [%d]'s nextidx:[%d]; CurIdx[%d~%d]\n",rf.me,len(rf.logs),i,rf.nextIndex[i],rf.logs[0].Index,rf.logs[len(rf.logs)-1].Index)
+			tmpLog := make([]LogEntry,rf.logs[len(rf.logs)-1].Index-rf.nextIndex[i]+1)
 			copy(tmpLog,rf.logs[rf.getIndexByAbsoluteIndex(rf.nextIndex[i]) : ])
 
 			go rf.callForAppend(i,rf.currentTerm,rf.me,rf.nextIndex[i]-1,rf.getTermByAbsoluteIndex(rf.nextIndex[i]-1),rf.commitIndex,tmpLog)
@@ -106,20 +102,71 @@ func (rf *Raft) callForAppend(peer,currentTerm,me,PrevLogIndex,PrevLogTerm,Leade
 			//so this packet was out of date(Term A),ignore it
 			return ;
 		}
+		
+		//2c bug!
+		//must check this reply is outdate reply or not!
+		if args.PrevLogIndex != rf.nextIndex[peer] - 1{
+			return 
+		}
 
 		if !reply.Success{
-			if rf.nextIndex[peer] > 0{
-				rf.nextIndex[peer] -= 1
+			if reply.ConflictTerm == -1{
+				rf.nextIndex[peer] = reply.ConflictIndex
 			}else{
-				rf.nextIndex[peer] = 0
+				findIdx := -1
+				for i := rf.logs[len(rf.logs)-1].Index + 1; i > rf.logs[0].Index; i-- {
+					if rf.getTermByAbsoluteIndex(i-1) == reply.ConflictTerm {
+						findIdx = i
+						break
+					}
+				}
+				if findIdx != -1 {
+					// if find a log of conflict term,
+					// set to the one beyond the index
+					rf.nextIndex[peer] = findIdx
+				} else {
+					// set the nextIdx to the conflict firstLog index of peer's logs
+					rf.nextIndex[peer] = reply.ConflictIndex
+				}
 			}
 			rf.resetAppendTimer(peer,true)
 		}else{
+			LogInfo("[%d] old_next[%d] succeed! new_old[%d] args.idx[%d]\n",peer,rf.nextIndex[peer],rf.nextIndex[peer] + len(logs),args.PrevLogIndex+1)
 			rf.nextIndex[peer] = rf.nextIndex[peer] + len(logs)
 			rf.matchIndex[peer] = rf.nextIndex[peer] - 1
 			//count all the peer's mathcIndex
 			//check if there are more than half of the matchIndex,
 			//if exist, update the commitIndex
+
+			// check whether can update commitIndex
+			// diff := make([]int, rf.logs[len(rf.logs)-1].Index+5)
+			// for i := 0; i < len(rf.peers); i++ {
+			// 	if i == rf.me {
+			// 		continue
+			// 	}
+			// 	diff[0] += 1
+			// 	diff[rf.matchIndex[i]+1] -= 1
+			// }
+			// ok_idx := 0
+			// for i := 1; i < len(diff); i++ {
+			// 	diff[i] += diff[i-1]
+			// 	if diff[i]+1 > len(rf.peers)/2 {
+			// 		ok_idx = i
+			// 	}
+			// }
+
+			// if ok_idx > rf.commitIndex && rf.getTermByAbsoluteIndex(ok_idx) == rf.currentTerm {
+			// 	// if there is new commit Log, add this to applyQueue
+			// 	for i := rf.commitIndex + 1; i <= ok_idx; i++ {
+			// 		rf.commitQueue = append(rf.commitQueue, ApplyMsg{
+			// 			CommandValid: true,
+			// 			CommandIndex: i,
+			// 			Command:      rf.logs[rf.getIndexByAbsoluteIndex(i)].Command,
+			// 		})
+			// 	}
+			// 	rf.commitIndex = ok_idx
+			// 	rf.cv.Broadcast()
+			// }
 			
 			newCommitindex := 0
 			count := make(map[int]int)
@@ -142,7 +189,6 @@ func (rf *Raft) callForAppend(peer,currentTerm,me,PrevLogIndex,PrevLogTerm,Leade
 				rf.commitIndex = newCommitindex
 				rf.cv.Broadcast()
 			}
-
 			rf.resetAppendTimer(peer,false)
 		}
 
@@ -164,14 +210,27 @@ func (rf *Raft) AppendEntries(args *appendArgs, reply *appendReply){
 
 	//check the log version
 	curLastLogIndex := rf.logs[len(rf.logs)-1].Index
-	if curLastLogIndex < args.PrevLogIndex  {
+	if curLastLogIndex < args.PrevLogIndex || rf.getTermByAbsoluteIndex(args.PrevLogIndex) != args.PrevLogTerm {
 		//my logs doesn't contain an entry at prevlogindex
 		reply.Success = false
 		reply.Term = args.Term
+
+		if args.PrevLogIndex > curLastLogIndex{
+			reply.ConflictIndex = rf.logs[len(rf.logs)-1].Index + 1
+			reply.ConflictTerm = -1
+		}else {
+			reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+			findIdx := args.PrevLogIndex
+			// find the index of the log of conflictTerm
+			for i := args.PrevLogIndex; i > rf.logs[0].Index; i-- {
+				if rf.getTermByAbsoluteIndex(i-1) != reply.ConflictTerm {
+					findIdx = i
+					break
+				}
+			}
+			reply.ConflictIndex = findIdx
+		}
 		//DeBugPrintf("%d's %d log's term is %d\n",rf.me,args.PrevLogIndex,rf.getTermByAbsoluteIndex(args.PrevLogIndex))
-	}else if rf.getTermByAbsoluteIndex(args.PrevLogIndex) != args.PrevLogTerm{
-		reply.Success = false
-		reply.Term = args.Term
 	}else{
 		reply.Success = true
 		reply.Term = args.Term
@@ -198,19 +257,30 @@ func (rf *Raft) AppendEntries(args *appendArgs, reply *appendReply){
 			rf.logs = rf.logs[0 : confictAbsIdx]
 			rf.logs = append(rf.logs, args.Entries[confictIdx - args.PrevLogIndex - 1:]...)
 		}
-
+		rf.persist()
 
 		LogInfo("leader's curLog:\n")
-		for i:=0; i<len(args.Entries);i++{
-			NoTimeLogInfo("{idx: %d,term: %d},",args.Entries[i].Index,args.Entries[i].Term)
+		for i:=0; i<=len(args.Entries);i++{
+			if (i!=0&&i % 5 == 0) || i == len(args.Entries){
+				NoTimeLogInfo("\n")
+			}
+
+			if i != len(args.Entries){
+				NoTimeLogInfo("{idx: %d,term: %d},",args.Entries[i].Index,args.Entries[i].Term)
+			}
+			
 		}
-		NoTimeLogInfo("\nconfict idx: %d, abs: %d\n",confictIdx,rf.getIndexByAbsoluteIndex(confictIdx))
+		NoTimeLogInfo("confict idx: %d, abs: %d\n",confictIdx,rf.getIndexByAbsoluteIndex(confictIdx))
 
 		LogInfo("%d 's curLog:\n",rf.me)
-		for i:=0; i<len(rf.logs);i++{
-			NoTimeLogInfo("{idx: %d,term: %d},",rf.logs[i].Index,rf.logs[i].Term)
+		for i:=0; i<=len(rf.logs);i++{
+			if  (i!=0&&i % 5 == 0) || i == len(rf.logs){
+				NoTimeLogInfo("\n")
+			}
+			if i != len(rf.logs){
+				NoTimeLogInfo("{idx: %d,term: %d},",rf.logs[i].Index,rf.logs[i].Term)
+			}
 		}
-		NoTimeLogInfo("\n")
 
 		//check leader's commit idx and update mine
 		commitIdxBak := rf.commitIndex
