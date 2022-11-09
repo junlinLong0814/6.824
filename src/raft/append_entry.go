@@ -110,6 +110,9 @@ func (rf *Raft) callForAppend(peer,currentTerm,me,PrevLogIndex,PrevLogTerm,Leade
 		}
 
 		if !reply.Success{
+			//1. Upon receiving a conflict response, the leader should first search its log for conflictTerm. 
+			//	If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+			//2. If it does not find an entry with that term, it should set nextIndex = conflictIndex.
 			if reply.ConflictTerm == -1{
 				rf.nextIndex[peer] = reply.ConflictIndex
 			}else{
@@ -126,6 +129,7 @@ func (rf *Raft) callForAppend(peer,currentTerm,me,PrevLogIndex,PrevLogTerm,Leade
 					rf.nextIndex[peer] = findIdx
 				} else {
 					// set the nextIdx to the conflict firstLog index of peer's logs
+					// throw the peer logs which in[ConflictIndex : ]
 					rf.nextIndex[peer] = reply.ConflictIndex
 				}
 			}
@@ -137,37 +141,6 @@ func (rf *Raft) callForAppend(peer,currentTerm,me,PrevLogIndex,PrevLogTerm,Leade
 			//count all the peer's mathcIndex
 			//check if there are more than half of the matchIndex,
 			//if exist, update the commitIndex
-
-			// check whether can update commitIndex
-			// diff := make([]int, rf.logs[len(rf.logs)-1].Index+5)
-			// for i := 0; i < len(rf.peers); i++ {
-			// 	if i == rf.me {
-			// 		continue
-			// 	}
-			// 	diff[0] += 1
-			// 	diff[rf.matchIndex[i]+1] -= 1
-			// }
-			// ok_idx := 0
-			// for i := 1; i < len(diff); i++ {
-			// 	diff[i] += diff[i-1]
-			// 	if diff[i]+1 > len(rf.peers)/2 {
-			// 		ok_idx = i
-			// 	}
-			// }
-
-			// if ok_idx > rf.commitIndex && rf.getTermByAbsoluteIndex(ok_idx) == rf.currentTerm {
-			// 	// if there is new commit Log, add this to applyQueue
-			// 	for i := rf.commitIndex + 1; i <= ok_idx; i++ {
-			// 		rf.commitQueue = append(rf.commitQueue, ApplyMsg{
-			// 			CommandValid: true,
-			// 			CommandIndex: i,
-			// 			Command:      rf.logs[rf.getIndexByAbsoluteIndex(i)].Command,
-			// 		})
-			// 	}
-			// 	rf.commitIndex = ok_idx
-			// 	rf.cv.Broadcast()
-			// }
-			
 			newCommitindex := 0
 			count := make(map[int]int)
 			for i:=0 ; i < len(rf.peers); i++{
@@ -214,12 +187,15 @@ func (rf *Raft) AppendEntries(args *appendArgs, reply *appendReply){
 		//my logs doesn't contain an entry at prevlogindex
 		reply.Success = false
 		reply.Term = args.Term
-
+		
+		//1. If a follower does not have prevLogIndex in its log, it should return with conflictIndex = len(log) and conflictTerm = None.
+		//2. If a follower does have prevLogIndex in its log, but the term does not match, 
+		//	it should return conflictTerm = log[prevLogIndex].Term, and then search its log for the first index whose entry has term equal to conflictTerm.
 		if args.PrevLogIndex > curLastLogIndex{
 			reply.ConflictIndex = rf.logs[len(rf.logs)-1].Index + 1
 			reply.ConflictTerm = -1
 		}else {
-			reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+			reply.ConflictTerm = rf.getTermByAbsoluteIndex(args.PrevLogIndex)
 			findIdx := args.PrevLogIndex
 			// find the index of the log of conflictTerm
 			for i := args.PrevLogIndex; i > rf.logs[0].Index; i-- {
